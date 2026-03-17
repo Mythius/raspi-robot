@@ -2,18 +2,11 @@
 """
 Headless USB webcam object detection for Raspberry Pi.
 
-Uses YOLOv8 (nano) via the ultralytics library and OpenCV for camera access.
-Detections are printed to stdout. No display required.
+Uses OpenCV's built-in DNN module with YOLOv3-tiny — no PyTorch or
+display required. Model files are downloaded automatically by run.sh.
 
 Usage:
     python3 detect.py [device_index_or_path]
-
-    # default: /dev/video0
-    python3 detect.py
-
-    # explicit device index or path
-    python3 detect.py 0
-    python3 detect.py /dev/video2
 
 Environment variables:
     CAMERA_DEVICE   V4L2 device index or path (default: 0)
@@ -21,7 +14,7 @@ Environment variables:
     CAMERA_HEIGHT   capture height (default: 480)
     DETECT_FPS      target frames per second (default: 2)
     CONFIDENCE      minimum confidence 0.0–1.0 (default: 0.5)
-    MODEL           YOLOv8 model variant: n/s/m/l/x (default: n = nano)
+    NMS_THRESHOLD   non-maximum suppression threshold (default: 0.4)
 """
 
 import os
@@ -30,38 +23,58 @@ import time
 from datetime import datetime
 
 import cv2
-from ultralytics import YOLO
+import numpy as np
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 def _parse_device(val: str) -> int | str:
-    """Return an int index if val is numeric, otherwise the raw path string."""
     try:
         return int(val)
     except ValueError:
         return val
 
-DEVICE     = _parse_device(sys.argv[1] if len(sys.argv) > 1
-                           else os.getenv("CAMERA_DEVICE", "0"))
-WIDTH      = int(os.getenv("CAMERA_WIDTH",  "640"))
-HEIGHT     = int(os.getenv("CAMERA_HEIGHT", "480"))
-FPS        = float(os.getenv("DETECT_FPS",  "2"))
-CONFIDENCE = float(os.getenv("CONFIDENCE",  "0.5"))
-VARIANT    = os.getenv("MODEL", "n")          # n=nano, s=small, m=medium …
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR    = os.path.join(SCRIPT_DIR, "models")
+
+DEVICE        = _parse_device(sys.argv[1] if len(sys.argv) > 1
+                               else os.getenv("CAMERA_DEVICE", "0"))
+WIDTH         = int(os.getenv("CAMERA_WIDTH",   "640"))
+HEIGHT        = int(os.getenv("CAMERA_HEIGHT",  "480"))
+FPS           = float(os.getenv("DETECT_FPS",   "2"))
+CONFIDENCE    = float(os.getenv("CONFIDENCE",   "0.5"))
+NMS_THRESHOLD = float(os.getenv("NMS_THRESHOLD","0.4"))
 
 FRAME_INTERVAL = 1.0 / FPS
 
-# ── Model & camera setup ───────────────────────────────────────────────────────
+# ── Load model ─────────────────────────────────────────────────────────────────
 
-print(f"Loading YOLOv8{VARIANT} model…", flush=True)
-model = YOLO(f"yolov8{VARIANT}.pt")   # downloads on first run (~6 MB for nano)
+names_path   = os.path.join(MODELS_DIR, "coco.names")
+weights_path = os.path.join(MODELS_DIR, "yolov3-tiny.weights")
+cfg_path     = os.path.join(MODELS_DIR, "yolov3-tiny.cfg")
+
+for p in (names_path, weights_path, cfg_path):
+    if not os.path.exists(p):
+        sys.exit(f"Missing model file: {p}\nRun ./run.sh to download models.")
+
+with open(names_path) as f:
+    CLASSES = [line.strip() for line in f if line.strip()]
+
+print("Loading YOLOv3-tiny model…", flush=True)
+net = cv2.dnn.readNet(weights_path, cfg_path)
+net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+layer_names   = net.getLayerNames()
+output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+
+# ── Camera setup ───────────────────────────────────────────────────────────────
 
 print(f"Opening camera {DEVICE!r} at {WIDTH}x{HEIGHT}…", flush=True)
 cap = cv2.VideoCapture(DEVICE)
 
 if not cap.isOpened():
     sys.exit(f"Error: could not open camera {DEVICE!r}\n"
-             f"Tip: run `ls /dev/video*` to list available cameras")
+             "Tip: run `ls /dev/video*` to list available cameras")
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
@@ -81,16 +94,36 @@ try:
             time.sleep(0.5)
             continue
 
-        results = model(frame, verbose=False, conf=CONFIDENCE)
+        h, w = frame.shape[:2]
+
+        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416),
+                                     swapRB=True, crop=False)
+        net.setInput(blob)
+        outputs = net.forward(output_layers)
+
+        boxes, confidences, class_ids = [], [], []
+
+        for output in outputs:
+            for detection in output:
+                scores    = detection[5:]
+                class_id  = int(np.argmax(scores))
+                confidence = float(scores[class_id])
+                if confidence < CONFIDENCE:
+                    continue
+                cx, cy, bw, bh = (detection[:4] * [w, h, w, h]).astype(int)
+                boxes.append([cx - bw // 2, cy - bh // 2, bw, bh])
+                confidences.append(confidence)
+                class_ids.append(class_id)
+
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE, NMS_THRESHOLD)
         ts = datetime.now().isoformat(timespec="seconds")
 
-        for r in results:
-            for box in r.boxes:
-                label      = model.names[int(box.cls)]
-                confidence = float(box.conf)
-                print(f"[{ts}]  {label:<20}  {confidence * 100:.1f}%", flush=True)
+        if len(indices) > 0:
+            for i in np.array(indices).flatten():
+                label = CLASSES[class_ids[i]]
+                conf  = confidences[i]
+                print(f"[{ts}]  {label:<20}  {conf * 100:.1f}%", flush=True)
 
-        # Throttle to target FPS
         elapsed = time.monotonic() - t0
         sleep_for = FRAME_INTERVAL - elapsed
         if sleep_for > 0:

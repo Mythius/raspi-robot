@@ -1,0 +1,11 @@
+# Python virtual environments
+.venv/
+
+# Model weights (downloaded automatically at runtime)
+*.pt
+*.weights
+usb-cam/models/
+
+# Python cache
+__pycache__/
+*.pyc
