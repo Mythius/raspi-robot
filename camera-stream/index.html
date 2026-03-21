@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Object Detection – raspi-robot</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111;
+      color: #eee;
+      font-family: monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 { font-size: 1rem; letter-spacing: 2px; margin-bottom: 12px; opacity: 0.6; }
+    #canvas-container canvas { display: block; border: 1px solid #333; }
+    #status { margin-top: 10px; font-size: 0.75rem; opacity: 0.5; }
+  </style>
+</head>
+<body>
+  <h1>OBJECT DETECTION</h1>
+  <div id="canvas-container"></div>
+  <div id="status">Connecting…</div>
+
+  <script>
+    const STREAM_URL = "https://vstream.msouthwick.com/stream";
+    const statusEl  = document.getElementById("status");
+
+    // We parse the MJPEG stream with fetch() instead of <img src> so that:
+    //  1. We get bytes as they arrive (no nginx buffering surprises)
+    //  2. Canvas drawImage works without tainted-canvas errors
+    //  3. ml5 can inspect real frame pixels
+
+    const frameImg   = new Image();   // current decoded frame (for display)
+    const detectImg  = new Image();   // stable snapshot handed to ml5
+    let   frameBlobUrl  = null;
+    let   detectBlobUrl = null;
+    let   frameReady    = false;
+    let   frameCount    = 0;
+
+    // JPEG markers
+    const SOI = [0xFF, 0xD8];
+    const EOI = [0xFF, 0xD9];
+
+    async function startStream() {
+      try {
+        const res = await fetch(STREAM_URL);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        statusEl.textContent = "Stream connected – loading model…";
+
+        const reader = res.body.getReader();
+        let   buf    = new Uint8Array(0);
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) { statusEl.textContent = "Stream ended"; break; }
+
+          // Append chunk to buffer
+          const next = new Uint8Array(buf.length + value.length);
+          next.set(buf);
+          next.set(value, buf.length);
+          buf = next;
+
+          // Extract all complete JPEG frames from buffer
+          // eslint-disable-next-line no-constant-condition
+          while (true) {
+            // Find SOI
+            let start = -1;
+            for (let i = 0; i < buf.length - 1; i++) {
+              if (buf[i] === 0xFF && buf[i + 1] === 0xD8) { start = i; break; }
+            }
+            if (start === -1) { buf = new Uint8Array(0); break; }
+
+            // Find EOI after SOI
+            let end = -1;
+            for (let i = start + 2; i < buf.length - 1; i++) {
+              if (buf[i] === 0xFF && buf[i + 1] === 0xD9) { end = i + 1; break; }
+            }
+            if (end === -1) {
+              // Incomplete frame — keep buf from start onward and wait for more data
+              buf = buf.slice(start);
+              break;
+            }
+
+            // We have a complete JPEG frame [start..end]
+            const jpeg = buf.slice(start, end + 1);
+            buf = buf.slice(end + 1);
+
+            // Swap in new frame via blob URL
+            const blob    = new Blob([jpeg], { type: "image/jpeg" });
+            const prevUrl = frameBlobUrl;
+            frameBlobUrl  = URL.createObjectURL(blob);
+
+            frameImg.onload = () => {
+              frameReady = true;
+              frameCount++;
+              // Revoke old URL only after new frame is painted — detectImg
+              // might be using it so defer slightly
+              if (prevUrl) setTimeout(() => URL.revokeObjectURL(prevUrl), 500);
+            };
+            frameImg.src = frameBlobUrl;
+          }
+        }
+      } catch (err) {
+        statusEl.textContent = `Stream error: ${err.message}`;
+        console.error(err);
+        // Retry after 3 s
+        setTimeout(startStream, 3000);
+      }
+    }
+
+    startStream();
+
+    // ─── p5 + ml5 ────────────────────────────────────────────────────────────
+
+    new p5(function (p) {
+      let detector;
+      let detections  = [];   // raw results from ml5
+      let tracked     = [];   // stable objects with frame counts
+      let modelReady  = false;
+      let lastLog     = 0;
+
+      const MIN_FRAMES  = 3;    // consecutive hits before drawing
+      const MAX_MISS    = 3;    // missed frames before removing
+      const MAX_DIST    = 0.25; // match radius for unconfirmed objects (fraction of image)
+      const MAX_DIST_CONFIRMED = 0.40; // looser radius once object is confirmed
+      const LERP        = 0.4;  // position smoothing (0=frozen, 1=snap)
+
+      function updateTracked(newDetections, imgW, imgH) {
+        const toNorm = d => ({
+          cx: (d.x + d.width  / 2) / imgW,
+          cy: (d.y + d.height / 2) / imgH,
+          x:  d.x / imgW,  y: d.y / imgH,
+          w:  d.width / imgW, h: d.height / imgH,
+        });
+
+        tracked.forEach(t => t.seenThisFrame = false);
+
+        newDetections.forEach(d => {
+          const n = toNorm(d);
+          const confirmed = best => best.frames >= MIN_FRAMES;
+
+          // Match against existing tracked object of same label, closest center
+          let best = null, bestDist = Infinity;
+          tracked.forEach(t => {
+            if (t.label !== d.label) return;
+            const dist = Math.hypot(t.cx - n.cx, t.cy - n.cy);
+            const limit = confirmed(t) ? MAX_DIST_CONFIRMED : MAX_DIST;
+            if (dist < limit && dist < bestDist) { bestDist = dist; best = t; }
+          });
+
+          if (best) {
+            // Lerp position so wild jumps are smoothed rather than snapping
+            best.cx = best.cx + (n.cx - best.cx) * LERP;
+            best.cy = best.cy + (n.cy - best.cy) * LERP;
+            best.sx = best.sx + (n.x  - best.sx) * LERP;
+            best.sy = best.sy + (n.y  - best.sy) * LERP;
+            best.sw = best.sw + (n.w  - best.sw) * LERP;
+            best.sh = best.sh + (n.h  - best.sh) * LERP;
+            best.confidence    = d.confidence;
+            best.frames++;
+            best.missed        = 0;
+            best.seenThisFrame = true;
+          } else {
+            tracked.push({
+              label: d.label, confidence: d.confidence,
+              cx: n.cx, cy: n.cy,
+              sx: n.x,  sy: n.y, sw: n.w, sh: n.h,
+              frames: 1, missed: 0, seenThisFrame: true,
+            });
+          }
+        });
+
+        tracked.forEach(t => {
+          if (!t.seenThisFrame) {
+            t.missed++;
+            t.frames = 0;
+          }
+        });
+        tracked = tracked.filter(t => t.missed <= MAX_MISS);
+      }
+
+      p.setup = function () {
+        const canvas = p.createCanvas(640, 480);
+        canvas.parent("canvas-container");
+        p.frameRate(30);
+
+        detector = ml5.objectDetector("cocossd", () => {
+          modelReady = true;
+          statusEl.textContent = "Model ready – detecting…";
+          detectLoop();
+        });
+      };
+
+      function detectLoop() {
+        if (!modelReady || !frameReady) { setTimeout(detectLoop, 100); return; }
+
+        // Snapshot current frame URL before async work
+        const snapUrl = frameBlobUrl;
+
+        // Set onload BEFORE src to avoid missing an instant-cache hit
+        detectImg.onload = () => {
+          if (!detectImg.naturalWidth || !detectImg.naturalHeight) {
+            setTimeout(detectLoop, 100);
+            return;
+          }
+          detector.detect(detectImg, (err, results) => {
+            if (err) {
+              console.warn("detect error:", err);
+            } else {
+              detections = results || [];
+              // Log first result once so we can verify coordinate space
+              if (detections.length && !window._coordLogged) {
+                window._coordLogged = true;
+                console.log("Sample detection:", detections[0],
+                  "| detectImg natural size:", detectImg.naturalWidth, "x", detectImg.naturalHeight,
+                  "| canvas:", p.width, "x", p.height);
+              }
+              updateTracked(detections, detectImg.naturalWidth || p.width, detectImg.naturalHeight || p.height);
+              const visible = tracked.filter(t => t.frames >= MIN_FRAMES);
+              statusEl.textContent = `Detecting… (${visible.length} object${visible.length !== 1 ? "s" : ""} found)`;
+              if (Date.now() - lastLog >= 60000) {
+                lastLog = Date.now();
+                console.log("[raspi-robot]", new Date().toLocaleTimeString(), visible.map(t => t.label));
+              }
+            }
+            setTimeout(detectLoop, 150);
+          });
+        };
+
+        detectImg.onerror = () => setTimeout(detectLoop, 150);
+        detectImg.src = snapUrl;
+      }
+
+      p.draw = function () {
+        if (!frameReady) {
+          p.background(30);
+          p.fill(80); p.noStroke();
+          p.textAlign(p.CENTER, p.CENTER);
+          p.textSize(13);
+          p.text("Waiting for stream…", p.width / 2, p.height / 2);
+          return;
+        }
+
+        p.drawingContext.drawImage(frameImg, 0, 0, p.width, p.height);
+
+        // sx/sy/sw/sh are normalized 0-1; scale to canvas pixels
+        tracked.filter(t => t.frames >= MIN_FRAMES).forEach(t => {
+          const x = t.sx * p.width;
+          const y = t.sy * p.height;
+          const w = t.sw * p.width;
+          const h = t.sh * p.height;
+          const label = `${t.label} ${Math.round(t.confidence * 100)}%`;
+
+          p.noFill();
+          p.stroke(0, 220, 100);
+          p.strokeWeight(2);
+          p.rect(x, y, w, h);
+
+          p.noStroke();
+          p.textSize(12);
+          const tw = p.textWidth(label) + 8;
+          p.fill(0, 220, 100);
+          p.rect(x, y - 16, tw, 16);
+          p.fill(0);
+          p.textAlign(p.LEFT, p.BOTTOM);
+          p.text(label, x + 4, y);
+        });
+
+        // HUD
+        p.fill(255, 255, 255, 160);
+        p.noStroke();
+        p.textSize(11);
+        p.textAlign(p.RIGHT, p.TOP);
+        p.text(`${Math.round(p.frameRate())} fps  |  frame #${frameCount}`, p.width - 6, 6);
+      };
+    });
+  </script>
+</body>
+</html>
