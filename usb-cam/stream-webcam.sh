@@ -2,6 +2,7 @@
 
 PORT=${1:-8080}
 DEVICE=${2:-/dev/video0}
+AUDIO=${3:-default}   # ALSA device for mic, e.g. hw:1,0 or "default"
 
 if [ ! -e "$DEVICE" ]; then
     echo "Error: Webcam device $DEVICE not found"
@@ -20,16 +21,17 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
-echo "Streaming $DEVICE on http://localhost:$PORT/"
+echo "Streaming $DEVICE + mic ($AUDIO) on http://localhost:$PORT/"
 echo "Open your browser to http://localhost:$PORT/"
 echo "Press Ctrl+C to stop"
 
-python3 - "$DEVICE" "$PORT" <<'EOF'
+python3 - "$DEVICE" "$PORT" "$AUDIO" <<'EOF'
 import subprocess, threading, time, sys
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 DEVICE = sys.argv[1]
 PORT   = int(sys.argv[2])
+AUDIO  = sys.argv[3]
 
 latest_frame = None
 frame_lock   = threading.Lock()
@@ -45,6 +47,7 @@ HTML = b"""<!DOCTYPE html>
 </head>
 <body>
   <img src="/stream">
+  <audio src="/audio" autoplay></audio>
 </body>
 </html>"""
 
@@ -80,6 +83,38 @@ class StreamHandler(BaseHTTPRequestHandler):
                     time.sleep(0.033)  # ~30 fps
             except Exception:
                 pass
+
+        elif self.path == '/audio':
+            # Stream opus audio in an OGG container — supported natively in all
+            # modern browsers without any JS needed.
+            self.send_response(200)
+            self.send_header('Content-Type', 'audio/ogg; codecs=opus')
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            cmd = [
+                'ffmpeg',
+                '-f', 'alsa', '-i', AUDIO,
+                '-c:a', 'libopus',
+                '-b:a', '64k',
+                '-vn',               # no video
+                '-f', 'ogg',
+                '-'
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                while True:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+            except Exception:
+                pass
+            finally:
+                proc.kill()
 
         else:
             self.send_response(404)

@@ -26,10 +26,12 @@
 <body>
   <h1>OBJECT DETECTION</h1>
   <div id="canvas-container"></div>
+  <audio id="audio" autoplay></audio>
   <div id="status">Connecting…</div>
 
   <script>
     const STREAM_URL = "https://vstream.msouthwick.com/stream";
+    const AUDIO_URL  = "https://vstream.msouthwick.com/audio";
     const statusEl  = document.getElementById("status");
 
     // We parse the MJPEG stream with fetch() instead of <img src> so that:
@@ -115,6 +117,8 @@
         setTimeout(startStream, 3000);
       }
     }
+
+    document.getElementById("audio").src = AUDIO_URL;
 
     startStream();
 
