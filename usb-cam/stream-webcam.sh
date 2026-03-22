@@ -85,19 +85,16 @@ class StreamHandler(BaseHTTPRequestHandler):
                 pass
 
         elif self.path == '/audio':
-            # Stream opus audio in an OGG container — supported natively in all
-            # modern browsers without any JS needed.
             self.send_response(200)
-            self.send_header('Content-Type', 'audio/ogg; codecs=opus')
-            self.send_header('Transfer-Encoding', 'chunked')
+            self.send_header('Content-Type', 'audio/mpeg')
             self.end_headers()
             cmd = [
                 'ffmpeg',
                 '-f', 'alsa', '-i', AUDIO,
-                '-c:a', 'libopus',
-                '-b:a', '64k',
-                '-vn',               # no video
-                '-f', 'ogg',
+                '-c:a', 'libmp3lame',
+                '-q:a', '5',
+                '-vn',
+                '-f', 'mp3',
                 '-'
             ]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
